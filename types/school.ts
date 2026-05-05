@@ -3,6 +3,8 @@ export type SchoolLevel = "elementary" | "middle" | "high";
 export interface SchoolRating {
   ela: number | null;
   math: number | null;
+  rating: number | null;
+  percentile: number | null;
 }
 
 export interface SchoolInfo {
