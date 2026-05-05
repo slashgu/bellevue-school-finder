@@ -3,7 +3,7 @@ import type { SchoolRating } from "@/types/school";
 
 type RatingsMap = Record<string, { ela: number | null; math: number | null }>;
 
-const ratings = ratingsData as RatingsMap;
+const ratings = ratingsData as unknown as RatingsMap;
 
 export function lookupRating(ospiName: string): SchoolRating | null {
   const key = ospiName.trim().toLowerCase();
