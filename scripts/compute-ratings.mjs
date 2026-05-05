@@ -1,9 +1,9 @@
 /**
  * Computes GreatSchools-style 1-10 school ratings using three OSPI 2018-19 datasets:
  *
- *  Test Score Rating     — %MetStandard ELA+Math (dataset 5y3z-mgxd)
- *  Student Progress      — Median Student Growth Percentile (dataset ufi5-ki2f)
- *  College Readiness     — Graduation rate + AP enrollment (datasets 6iji-4nux + 2zsf-krin, HS only)
+ *  Test Score Rating     — %MetStandard ELA+Math (dataset x73g-mrqp, 2023-24)
+ *  Student Progress      — Median Student Growth Percentile (dataset cxts-amj6, 2023-24)
+ *  College Readiness     — Graduation rate + AP enrollment (datasets 76iv-8ed4 + q9gf-prrp, 2023-24, HS only)
  *
  * Methodology (matches GreatSchools):
  *  1. For each sub-rating: compute school-level average → rank statewide → percentile → 1-10 decile
@@ -67,17 +67,18 @@ function avg(arr) {
 // ── 1. Test Score Rating ─────────────────────────────────────────────────────
 
 async function fetchTestScores() {
-  console.log("\n[1/3] Fetching Test Score data (5y3z-mgxd)…");
+  console.log("\n[1/3] Fetching Test Score data (x73g-mrqp, 2023-24)…");
   const base =
-    "https://data.wa.gov/resource/5y3z-mgxd.json" +
+    "https://data.wa.gov/resource/x73g-mrqp.json" +
     "?$where=studentgroup%3D'All%20Students'%20AND%20organizationlevel%3D'School'" +
     "%20AND%20(testsubject%3D'ELA'%20OR%20testsubject%3D'Math')" +
-    "&$select=schoolname,districtname,testsubject,percentmetstandard";
-  const rows = await fetchBatched(base, 23700);
+    "%20AND%20testadministration%3D'SBAC'" +
+    "&$select=schoolname,districtname,testsubject,percent_consistent_grade_level_knowledge_and_above";
+  const rows = await fetchBatched(base, 25000);
 
   const map = new Map();
   for (const r of rows) {
-    const pct = parseNum(r.percentmetstandard);
+    const pct = parseNum(r.percent_consistent_grade_level_knowledge_and_above);
     if (pct === null) continue;
     const key = `${r.districtname}|||${r.schoolname}`;
     if (!map.has(key)) map.set(key, { schoolname: r.schoolname, districtname: r.districtname, ela: [], math: [] });
@@ -111,12 +112,12 @@ async function fetchTestScores() {
 // ── 2. Student Progress Rating ───────────────────────────────────────────────
 
 async function fetchStudentProgress() {
-  console.log("\n[2/3] Fetching Student Growth data (ufi5-ki2f)…");
+  console.log("\n[2/3] Fetching Student Growth data (cxts-amj6, 2023-24)…");
   const base =
-    "https://data.wa.gov/resource/ufi5-ki2f.json" +
+    "https://data.wa.gov/resource/cxts-amj6.json" +
     "?$where=studentgroup%3D'All%20Students'%20AND%20organizationlevel%3D'School'" +
     "&$select=schoolname,districtname,subject,mediansgp";
-  const rows = await fetchBatched(base, 60500);
+  const rows = await fetchBatched(base, 13000);
 
   const map = new Map();
   for (const r of rows) {
@@ -143,9 +144,9 @@ async function fetchStudentProgress() {
 async function fetchCollegeReadiness() {
   console.log("\n[3/3] Fetching College Readiness data…");
 
-  // 3a. Graduation rates
+  // 3a. Graduation rates (2023-24)
   const gradBase =
-    "https://data.wa.gov/resource/6iji-4nux.json" +
+    "https://data.wa.gov/resource/76iv-8ed4.json" +
     "?$where=organizationlevel%3D'School'%20AND%20studentgroup%3D'All%20Students'" +
     "%20AND%20cohort%3D'Four%20Year'" +
     "&$select=schoolname,districtname,graduationrate";
@@ -160,22 +161,23 @@ async function fetchCollegeReadiness() {
     gradMap.get(key).gradRates.push(rate);
   }
 
-  // 3b. AP enrollment
+  // 3b. AP enrollment (2023-24) — rate = apcoursenumber / denominator
   const apBase =
-    "https://data.wa.gov/resource/2zsf-krin.json" +
+    "https://data.wa.gov/resource/q9gf-prrp.json" +
     "?$where=organizationlevel%3D'School'%20AND%20studentgroup%3D'All%20Students'" +
-    "%20AND%20gradelevel%3D'All%20Grades'%20AND%20measures%3D'Dual%20Credit'" +
-    "&$select=schoolname,districtname,percenttakingap,percenttakingib";
+    "%20AND%20gradelevel%3D'All%20Grades'%20AND%20measure%3D'Dual%20Credit'" +
+    "&$select=schoolname,districtname,apcoursenumber,ibcoursenumber,denominator";
   const apRows = await fetchBatched(apBase, 2400);
 
   const apMap = new Map();
   for (const r of apRows) {
-    const ap = parseNum(r.percenttakingap);
-    const ib = parseNum(r.percenttakingib);
-    if (ap === null) continue;
+    const ap = parseNum(r.apcoursenumber);
+    const ib = parseNum(r.ibcoursenumber) ?? 0;
+    const denom = parseNum(r.denominator);
+    if (ap === null || denom === null || denom === 0) continue;
     const key = `${r.districtname}|||${r.schoolname}`;
     // Combined AP+IB rate, capped at 1
-    apMap.set(key, { schoolname: r.schoolname, districtname: r.districtname, apRate: Math.min(1, ap + (ib ?? 0)) });
+    apMap.set(key, { schoolname: r.schoolname, districtname: r.districtname, apRate: Math.min(1, (ap + ib) / denom) });
   }
 
   // Merge: only schools with both grad + AP data are true HS
@@ -220,17 +222,20 @@ function combineRatings(testScores, progressData, collegeReadiness) {
     let overall = null;
 
     if (ts !== null && spR !== null) {
-      // GreatSchools weighting: dominant sub-rating = 0.45, others = 0.27
-      const dominant = spR > ts ? spR : ts;
-      const other    = spR > ts ? ts   : spR;
-      let wDom = 0.45, wOther = 0.27, wCR = 0;
-
-      if (crR !== null) {
-        wCR = 0.27;
-      }
-
-      const total = wDom + wOther + wCR;
-      overall = Math.round((dominant * (wDom / total)) + (other * (wOther / total)) + (crR ?? 0) * (wCR / total));
+      // Both TS + SP available: dominant=max, other=min, CR optional
+      const dominant = Math.max(ts, spR);
+      const other    = Math.min(ts, spR);
+      const wCR = crR !== null ? 0.27 : 0;
+      const total = 0.45 + 0.27 + wCR;
+      overall = Math.round(dominant*(0.45/total) + other*(0.27/total) + (crR ?? 0)*(wCR/total));
+    } else if (ts !== null && crR !== null) {
+      // TS + CR only (HS without growth data): TS dominant + CR
+      const total = 0.45 + 0.27;
+      overall = Math.round(ts*(0.45/total) + crR*(0.27/total));
+    } else if (spR !== null && crR !== null) {
+      // SP + CR only: SP dominant + CR
+      const total = 0.45 + 0.27;
+      overall = Math.round(spR*(0.45/total) + crR*(0.27/total));
     } else if (ts !== null) {
       overall = ts;
     } else if (spR !== null) {
@@ -273,7 +278,7 @@ function buildOutput(schools) {
   }
   return {
     _meta: {
-      source: "OSPI 2018-19: assessment (5y3z-mgxd), growth (ufi5-ki2f), graduation (6iji-4nux), AP (2zsf-krin)",
+      source: "OSPI 2023-24: assessment (x73g-mrqp), growth (cxts-amj6), graduation (76iv-8ed4), AP (q9gf-prrp)",
       methodology: "GreatSchools Test Score + Student Progress + College Readiness (HS) → statewide percentile decile → weighted composite 1-10",
       generated: new Date().toISOString(),
     },

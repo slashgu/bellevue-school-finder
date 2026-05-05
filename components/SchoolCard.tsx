@@ -86,7 +86,7 @@ export default function SchoolCard({ school }: { school: SchoolInfo }) {
       {school.rating ? (
         <div className="flex flex-col gap-2.5 pt-1 border-t border-gray-200">
           <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide">
-            Rating Breakdown (2018-19)
+            Rating Breakdown (2023-24)
           </p>
 
           <SubRatingRow label="Test Scores" value={school.rating.testScoreRating}
