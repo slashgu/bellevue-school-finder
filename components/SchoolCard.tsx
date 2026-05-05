@@ -36,6 +36,22 @@ function ProficiencyBar({ label, value }: { label: string; value: number | null 
   );
 }
 
+function SubRatingRow({ label, value, detail }: { label: string; value: number | null; detail?: string }) {
+  if (value === null) return null;
+  const color = value >= 8 ? "bg-green-600" : value >= 6 ? "bg-amber-500" : "bg-orange-600";
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-col min-w-0">
+        <span className="text-xs text-gray-700 font-medium">{label}</span>
+        {detail && <span className="text-[11px] text-gray-500 truncate">{detail}</span>}
+      </div>
+      <span className={`shrink-0 inline-flex items-center justify-center w-7 h-7 rounded-md text-xs font-bold text-white ${color}`}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
 export default function SchoolCard({ school }: { school: SchoolInfo }) {
   const r = school.rating?.rating ?? null;
 
@@ -66,16 +82,29 @@ export default function SchoolCard({ school }: { school: SchoolInfo }) {
         <p className="text-xs text-gray-600 mt-0.5">{school.address}</p>
       </div>
 
-      {/* Proficiency bars */}
+      {/* Ratings breakdown */}
       {school.rating ? (
-        <div className="flex flex-col gap-2 pt-1 border-t border-gray-200">
+        <div className="flex flex-col gap-2.5 pt-1 border-t border-gray-200">
           <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide">
-            OSPI % Met Standard (2018-19)
+            Rating Breakdown (2018-19)
           </p>
-          <ProficiencyBar label="ELA" value={school.rating.ela} />
-          <ProficiencyBar label="Math" value={school.rating.math} />
+
+          <SubRatingRow label="Test Scores" value={school.rating.testScoreRating}
+            detail={school.rating.ela != null && school.rating.math != null
+              ? `ELA ${school.rating.ela}% · Math ${school.rating.math}%`
+              : undefined}
+          />
+          <SubRatingRow label="Student Progress" value={school.rating.progressRating} />
+          {school.rating.collegeReadinessRating != null && (
+            <SubRatingRow label="College Readiness" value={school.rating.collegeReadinessRating}
+              detail={school.rating.gradRate != null
+                ? `Grad ${school.rating.gradRate}% · AP ${school.rating.apRate ?? "?"}%`
+                : undefined}
+            />
+          )}
+
           {school.rating.percentile !== null && (
-            <p className="text-xs text-gray-600">
+            <p className="text-xs text-gray-600 pt-1 border-t border-gray-100">
               Statewide percentile: <span className="font-medium">{school.rating.percentile}th</span>
             </p>
           )}

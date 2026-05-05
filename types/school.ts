@@ -5,6 +5,11 @@ export interface SchoolRating {
   math: number | null;
   rating: number | null;
   percentile: number | null;
+  testScoreRating: number | null;
+  progressRating: number | null;
+  collegeReadinessRating: number | null;
+  gradRate: number | null;
+  apRate: number | null;
 }
 
 export interface SchoolInfo {

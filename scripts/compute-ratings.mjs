@@ -1,147 +1,313 @@
 /**
- * Fetches WA statewide OSPI 2018-19 assessment data, computes per-school
- * ELA+Math averages, ranks all schools statewide, and maps to a 1-10
- * decile score matching GreatSchools' Test Score Rating methodology.
+ * Computes GreatSchools-style 1-10 school ratings using three OSPI 2018-19 datasets:
+ *
+ *  Test Score Rating     — %MetStandard ELA+Math (dataset 5y3z-mgxd)
+ *  Student Progress      — Median Student Growth Percentile (dataset ufi5-ki2f)
+ *  College Readiness     — Graduation rate + AP enrollment (datasets 6iji-4nux + 2zsf-krin, HS only)
+ *
+ * Methodology (matches GreatSchools):
+ *  1. For each sub-rating: compute school-level average → rank statewide → percentile → 1-10 decile
+ *  2. Weight sub-ratings:
+ *     - Dominant sub-rating (higher of TS or SP) gets 0.45
+ *     - Other sub-rating gets 0.27
+ *     - College Readiness (if available) gets 0.27
+ *     - Normalize weights to sum to 1
+ *  3. Overall = weighted sum of sub-ratings, rounded to nearest integer
  *
  * Output: data/ospi-ratings.json
  */
 
-import { writeFileSync, readFileSync } from "fs";
+import { writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
 
-const API = "https://data.wa.gov/resource/5y3z-mgxd.json";
-const BATCH = 5000;
-const TOTAL = 23700;
+// ── helpers ───────────────────────────────────────���──────────────────────────
 
-async function fetchAll() {
-  const records = [];
-  for (let offset = 0; offset < TOTAL; offset += BATCH) {
-    const url =
-      `${API}?$where=studentgroup%3D'All%20Students'%20AND%20organizationlevel%3D'School'%20AND%20(testsubject%3D'ELA'%20OR%20testsubject%3D'Math')` +
-      `&$select=schoolname,districtname,testsubject,percentmetstandard` +
-      `&$limit=${BATCH}&$offset=${offset}`;
-    process.stdout.write(`Fetching offset ${offset}…`);
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status} at offset ${offset}`);
-    const batch = await res.json();
-    records.push(...batch);
-    console.log(` got ${batch.length}`);
-    if (batch.length < BATCH) break;
-  }
-  return records;
-}
-
-function parsePercent(val) {
-  if (!val) return null;
+function parseNum(val) {
+  if (val === null || val === undefined || val === "") return null;
   const n = parseFloat(val);
   return isNaN(n) ? null : n;
 }
 
-function computeSchoolAverages(records) {
-  // schoolKey → { ela: number[], math: number[] }
+async function fetchBatched(baseUrl, total, batchSize = 5000) {
+  const records = [];
+  for (let offset = 0; offset < total + batchSize; offset += batchSize) {
+    const url = `${baseUrl}&$limit=${batchSize}&$offset=${offset}`;
+    process.stdout.write(`  offset ${offset}…`);
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+    const batch = await res.json();
+    records.push(...batch);
+    console.log(` ${batch.length}`);
+    if (batch.length < batchSize) break;
+  }
+  return records;
+}
+
+/** Rank an array of schools by `scoreKey` ascending → assign percentile + 1-10 decile */
+function assignDecile(schools, scoreKey, outputKey) {
+  const valid = schools.filter((s) => s[scoreKey] != null);
+  valid.sort((a, b) => a[scoreKey] - b[scoreKey]);
+  const n = valid.length;
+  valid.forEach((s, i) => {
+    const pct = ((i + 1) / n) * 100;
+    s[outputKey] = Math.min(10, Math.ceil(pct / 10));
+    s[`${outputKey}Pct`] = Math.round(pct);
+  });
+}
+
+function avg(arr) {
+  const nums = arr.filter((x) => x != null);
+  return nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+}
+
+// ── 1. Test Score Rating ─────────────────────────────────────────────────────
+
+async function fetchTestScores() {
+  console.log("\n[1/3] Fetching Test Score data (5y3z-mgxd)…");
+  const base =
+    "https://data.wa.gov/resource/5y3z-mgxd.json" +
+    "?$where=studentgroup%3D'All%20Students'%20AND%20organizationlevel%3D'School'" +
+    "%20AND%20(testsubject%3D'ELA'%20OR%20testsubject%3D'Math')" +
+    "&$select=schoolname,districtname,testsubject,percentmetstandard";
+  const rows = await fetchBatched(base, 23700);
+
   const map = new Map();
-
-  for (const r of records) {
-    const pct = parsePercent(r.percentmetstandard);
+  for (const r of rows) {
+    const pct = parseNum(r.percentmetstandard);
     if (pct === null) continue;
-
     const key = `${r.districtname}|||${r.schoolname}`;
     if (!map.has(key)) map.set(key, { schoolname: r.schoolname, districtname: r.districtname, ela: [], math: [] });
-
-    const entry = map.get(key);
-    if (r.testsubject === "ELA") entry.ela.push(pct);
-    else if (r.testsubject === "Math") entry.math.push(pct);
+    const e = map.get(key);
+    if (r.testsubject === "ELA") e.ela.push(pct);
+    else if (r.testsubject === "Math") e.math.push(pct);
   }
 
   const schools = [];
-  for (const [, entry] of map) {
-    const elaAvg = entry.ela.length ? entry.ela.reduce((a, b) => a + b, 0) / entry.ela.length : null;
-    const mathAvg = entry.math.length ? entry.math.reduce((a, b) => a + b, 0) / entry.math.length : null;
-
-    let overall = null;
-    if (elaAvg !== null && mathAvg !== null) overall = (elaAvg + mathAvg) / 2;
-    else if (elaAvg !== null) overall = elaAvg;
-    else if (mathAvg !== null) overall = mathAvg;
-
-    if (overall !== null) {
+  for (const [, e] of map) {
+    const elaAvg = avg(e.ela);
+    const mathAvg = avg(e.math);
+    const overall = elaAvg != null && mathAvg != null ? (elaAvg + mathAvg) / 2
+                  : elaAvg ?? mathAvg;
+    if (overall != null) {
       schools.push({
-        schoolname: entry.schoolname,
-        districtname: entry.districtname,
-        ela: elaAvg !== null ? Math.round(elaAvg) : null,
-        math: mathAvg !== null ? Math.round(mathAvg) : null,
-        overall,
+        schoolname: e.schoolname,
+        districtname: e.districtname,
+        ela: elaAvg != null ? Math.round(elaAvg) : null,
+        math: mathAvg != null ? Math.round(mathAvg) : null,
+        tsScore: overall,
       });
     }
   }
+
+  assignDecile(schools, "tsScore", "tsRating");
+  console.log(`  → ${schools.length} schools with test score data`);
   return schools;
 }
 
-function assignRatings(schools) {
-  // Sort by overall ascending
-  schools.sort((a, b) => a.overall - b.overall);
-  const n = schools.length;
+// ── 2. Student Progress Rating ───────────────────────────────────────────────
 
-  for (let i = 0; i < n; i++) {
-    // Percentile rank: proportion of schools scoring <= this school
-    const percentile = ((i + 1) / n) * 100;
-    // Decile → 1-10 (top 10% = 10, next 10% = 9, …)
-    const rating = Math.min(10, Math.ceil(percentile / 10));
-    schools[i].rating = rating;
-    schools[i].percentile = Math.round(percentile);
+async function fetchStudentProgress() {
+  console.log("\n[2/3] Fetching Student Growth data (ufi5-ki2f)…");
+  const base =
+    "https://data.wa.gov/resource/ufi5-ki2f.json" +
+    "?$where=studentgroup%3D'All%20Students'%20AND%20organizationlevel%3D'School'" +
+    "&$select=schoolname,districtname,subject,mediansgp";
+  const rows = await fetchBatched(base, 60500);
+
+  const map = new Map();
+  for (const r of rows) {
+    const sgp = parseNum(r.mediansgp);
+    if (sgp === null) continue;
+    const key = `${r.districtname}|||${r.schoolname}`;
+    if (!map.has(key)) map.set(key, { schoolname: r.schoolname, districtname: r.districtname, sgps: [] });
+    map.get(key).sgps.push(sgp);
   }
+
+  const schools = [];
+  for (const [, e] of map) {
+    const spScore = avg(e.sgps);
+    if (spScore != null) schools.push({ schoolname: e.schoolname, districtname: e.districtname, spScore });
+  }
+
+  assignDecile(schools, "spScore", "spRating");
+  console.log(`  → ${schools.length} schools with growth data`);
   return schools;
 }
+
+// ── 3. College Readiness Rating (HS only) ───────────────────────────────��────
+
+async function fetchCollegeReadiness() {
+  console.log("\n[3/3] Fetching College Readiness data…");
+
+  // 3a. Graduation rates
+  const gradBase =
+    "https://data.wa.gov/resource/6iji-4nux.json" +
+    "?$where=organizationlevel%3D'School'%20AND%20studentgroup%3D'All%20Students'" +
+    "%20AND%20cohort%3D'Four%20Year'" +
+    "&$select=schoolname,districtname,graduationrate";
+  const gradRows = await fetchBatched(gradBase, 800);
+
+  const gradMap = new Map();
+  for (const r of gradRows) {
+    const rate = parseNum(r.graduationrate);
+    if (rate === null) continue;
+    const key = `${r.districtname}|||${r.schoolname}`;
+    if (!gradMap.has(key)) gradMap.set(key, { schoolname: r.schoolname, districtname: r.districtname, gradRates: [] });
+    gradMap.get(key).gradRates.push(rate);
+  }
+
+  // 3b. AP enrollment
+  const apBase =
+    "https://data.wa.gov/resource/2zsf-krin.json" +
+    "?$where=organizationlevel%3D'School'%20AND%20studentgroup%3D'All%20Students'" +
+    "%20AND%20gradelevel%3D'All%20Grades'%20AND%20measures%3D'Dual%20Credit'" +
+    "&$select=schoolname,districtname,percenttakingap,percenttakingib";
+  const apRows = await fetchBatched(apBase, 2400);
+
+  const apMap = new Map();
+  for (const r of apRows) {
+    const ap = parseNum(r.percenttakingap);
+    const ib = parseNum(r.percenttakingib);
+    if (ap === null) continue;
+    const key = `${r.districtname}|||${r.schoolname}`;
+    // Combined AP+IB rate, capped at 1
+    apMap.set(key, { schoolname: r.schoolname, districtname: r.districtname, apRate: Math.min(1, ap + (ib ?? 0)) });
+  }
+
+  // Merge: only schools with both grad + AP data are true HS
+  const schools = [];
+  for (const [key, g] of gradMap) {
+    const ap = apMap.get(key);
+    if (!ap) continue;
+    const gradRate = avg(g.gradRates);
+    const apRate = ap.apRate;
+    if (gradRate == null) continue;
+    // Composite: equal weight grad (50%) + AP enrollment (50%)
+    schools.push({
+      schoolname: g.schoolname,
+      districtname: g.districtname,
+      crScore: (gradRate * 0.5 + apRate * 0.5) * 100, // scale to 0-100 for ranking
+      gradRate: Math.round(gradRate * 100),
+      apRate: Math.round(apRate * 100),
+    });
+  }
+
+  assignDecile(schools, "crScore", "crRating");
+  console.log(`  → ${schools.length} high schools with college readiness data`);
+  return schools;
+}
+
+// ── 4. Combine & apply GreatSchools weighting ────────────────────────────────
+
+function combineRatings(testScores, progressData, collegeReadiness) {
+  // Build lookup maps by schoolname (district+name key)
+  const spMap = new Map(progressData.map((s) => [`${s.districtname}|||${s.schoolname}`, s]));
+  const crMap = new Map(collegeReadiness.map((s) => [`${s.districtname}|||${s.schoolname}`, s]));
+
+  return testScores.map((s) => {
+    const key = `${s.districtname}|||${s.schoolname}`;
+    const sp = spMap.get(key);
+    const cr = crMap.get(key);
+
+    const ts = s.tsRating ?? null;
+    const spR = sp?.spRating ?? null;
+    const crR = cr?.crRating ?? null;
+
+    let overall = null;
+
+    if (ts !== null && spR !== null) {
+      // GreatSchools weighting: dominant sub-rating = 0.45, others = 0.27
+      const dominant = spR > ts ? spR : ts;
+      const other    = spR > ts ? ts   : spR;
+      let wDom = 0.45, wOther = 0.27, wCR = 0;
+
+      if (crR !== null) {
+        wCR = 0.27;
+      }
+
+      const total = wDom + wOther + wCR;
+      overall = Math.round((dominant * (wDom / total)) + (other * (wOther / total)) + (crR ?? 0) * (wCR / total));
+    } else if (ts !== null) {
+      overall = ts;
+    } else if (spR !== null) {
+      overall = spR;
+    }
+
+    return {
+      schoolname: s.schoolname,
+      districtname: s.districtname,
+      ela: s.ela,
+      math: s.math,
+      tsRating: ts,
+      spRating: spR,
+      crRating: crR,
+      gradRate: cr?.gradRate ?? null,
+      apRate: cr?.apRate ?? null,
+      rating: overall,
+      percentile: s.tsRatingPct ?? null,
+    };
+  });
+}
+
+// ── 5. Output ─────────────────────────────────────────────────────────────────
 
 function buildOutput(schools) {
-  const meta = {
-    _meta: {
-      source: "Washington State OSPI Report Card Assessment Data 2018-19 (data.wa.gov dataset 5y3z-mgxd)",
-      methodology: "Test Score Rating: average ELA+Math %MetStandard (All Students, all grades) → statewide percentile rank → 1-10 decile (matches GreatSchools Test Score Rating approach)",
-      total_schools_ranked: schools.length,
-      generated: new Date().toISOString(),
-    },
-  };
-
   const entries = {};
   for (const s of schools) {
+    if (s.rating === null) continue;
     entries[s.schoolname] = {
       ela: s.ela,
       math: s.math,
       rating: s.rating,
       percentile: s.percentile,
+      testScoreRating: s.tsRating,
+      progressRating: s.spRating,
+      collegeReadinessRating: s.crRating,
+      gradRate: s.gradRate,
+      apRate: s.apRate,
     };
   }
-  return { ...meta, ...entries };
+  return {
+    _meta: {
+      source: "OSPI 2018-19: assessment (5y3z-mgxd), growth (ufi5-ki2f), graduation (6iji-4nux), AP (2zsf-krin)",
+      methodology: "GreatSchools Test Score + Student Progress + College Readiness (HS) → statewide percentile decile → weighted composite 1-10",
+      generated: new Date().toISOString(),
+    },
+    ...entries,
+  };
 }
 
+// ── main ──────────────────────────────────────────────────────────────────────
+
 async function main() {
-  console.log("Fetching statewide WA assessment data…");
-  const records = await fetchAll();
-  console.log(`\nTotal records fetched: ${records.length}`);
+  const [testScores, progressData, collegeReadiness] = await Promise.all([
+    fetchTestScores(),
+    fetchStudentProgress(),
+    fetchCollegeReadiness(),
+  ]);
 
-  console.log("Computing per-school averages…");
-  const schools = computeSchoolAverages(records);
-  console.log(`Schools with valid data: ${schools.length}`);
+  console.log("\nCombining sub-ratings with GreatSchools weighting…");
+  const combined = combineRatings(testScores, progressData, collegeReadiness);
 
-  console.log("Assigning statewide percentile ratings…");
-  assignRatings(schools);
-
-  // Show BSD school ratings for verification
-  const bsd = schools.filter((s) => s.districtname === "Bellevue School District");
-  console.log("\nBellevue School District ratings:");
-  bsd.sort((a, b) => b.rating - a.rating);
+  // Print BSD schools for verification
+  const bsd = combined.filter((s) => s.districtname === "Bellevue School District");
+  bsd.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
+  console.log("\nBellevue School District final ratings:");
   for (const s of bsd) {
-    console.log(`  ${s.schoolname.padEnd(40)} ELA:${String(s.ela ?? "N/A").padStart(4)}  Math:${String(s.math ?? "N/A").padStart(4)}  Rating:${s.rating}/10  (${s.percentile}th pct)`);
+    const cr = s.crRating != null ? ` CR:${s.crRating}` : "";
+    console.log(
+      `  ${s.schoolname.padEnd(42)} TS:${String(s.tsRating ?? "-").padStart(2)}  SP:${String(s.spRating ?? "-").padStart(2)}${cr.padEnd(6)}  → ${s.rating ?? "?"}/10`
+    );
   }
 
-  const output = buildOutput(schools);
+  const output = buildOutput(combined);
   const outPath = join(ROOT, "data", "ospi-ratings.json");
   writeFileSync(outPath, JSON.stringify(output, null, 2));
-  console.log(`\nWrote ${Object.keys(output) - 1} schools to ${outPath}`);
+  console.log(`\nWrote ${Object.keys(output).length - 1} schools to ${outPath}`);
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });
